@@ -23,19 +23,94 @@ zig build -Doptimize=ReleaseFast
 
 ## How This Mirrors Lodestar TS
 
-Current Zig implementation mirrors the TypeScript clock at behavior level:
+This implementation mirrors Lodestar `clock.ts` at behavioral level, not by
+line-by-line translation.
 
-1. Slot/epoch progression:
-   - TS recursive `setTimeout(onNextSlot)` is mapped to Zig `timerLoop -> onNextSlot`.
-   - If multiple slots were missed (e.g. process stall), `onNextSlot` catches up slot-by-slot and emits events in order.
-2. Wait semantics:
-   - `waitForSlot(target)` resolves when `currentSlot >= target`.
-   - Abort path rejects/returns aborted state for pending waits.
-3. Gossip disparity checks:
-   - Same acceptance model for current / next / previous slot windows using `maximum_gossip_clock_disparity_ms`.
-4. Time model:
-   - Public API is millisecond-based (`u64` inputs for absolute/tolerance time).
-   - Slot and epoch remain `u64`.
+### Runtime model
+
+1. Timer scheduling model:
+   - TS uses recursive `setTimeout(onNextSlot)`.
+   - Zig uses one async loop: `timerLoop -> sleepMs(msUntilNextSlot) -> onNextSlot`.
+2. Catch-up model:
+   - If local time jumps ahead, `onNextSlot` advances from cached slot to
+     current wall-clock slot one-by-one.
+   - This preserves deterministic emission order for missed slots.
+3. Lazy start:
+   - Clock loop is started on first active API usage (`ensureStarted`), same
+     practical lifecycle as TS where timers are only meaningful after startup.
+4. Re-alignment on drift:
+   - `currentSlot()` detects slot jumps and calls `rearmTimer()` to cancel and
+     restart the loop so wake-ups stay aligned to slot boundaries.
+
+### Event ordering mirror
+
+Per advanced slot, the order is:
+
+1. increment `current_slot_cache`
+2. emit slot event
+3. resolve waiters whose target slot is reached
+4. if epoch changed, emit epoch event
+
+This matches Lodestar's expected "slot-first, epoch-after-boundary" behavior.
+The step-by-step deterministic order is validated by tests.
+
+### WaitForSlot mirror
+
+`waitForSlot(target)` mirrors TS promise semantics:
+
+1. Fast-path: return immediately when `currentSlot >= target`
+2. Otherwise register waiter
+3. Trigger one synchronous catch-up check (`currentSlot()`)
+4. Block until:
+   - target reached -> success
+   - aborted -> `error.Aborted`
+
+Pending waiters are woken both on normal slot advancement and abort path.
+
+### Abort mirror
+
+`AbortSignal` provides:
+
+- atomic aborted flag
+- callback registration/unregistration
+- at-most-once callback invocation on abort
+
+Clock subscribes once, and on abort it:
+
+1. marks and wakes all pending waiters
+2. cancels timer loop future
+
+Equivalent intent: TS abort rejects pending waits and stops future ticking.
+
+### Gossip disparity mirror
+
+`isCurrentSlotGivenGossipDisparity` and
+`currentSlotWithGossipDisparity` implement the same acceptance windows:
+
+- current slot accepted directly
+- near next boundary: next slot accepted
+- just after current boundary: previous slot accepted
+
+All checks use `maximum_gossip_clock_disparity_ms`.
+
+### Time and numeric model
+
+- Public time API is millisecond-based (`u64` for absolute/tolerance inputs).
+- `Slot`/`Epoch` are `u64`.
+- `computeTimeAtSlotMs`, `msFromSlot`, and `slotWithPastToleranceMs` return
+  `error.Overflow` on arithmetic overflow (explicit error path in Zig).
+
+This keeps behavior explicit and predictable in native code while preserving
+the same core clock semantics.
+
+### TS -> Zig mapping
+
+- TS `setTimeout(onNextSlot)` -> Zig `timerLoop`
+- TS `onNextSlot` recursion -> Zig `onNextSlot` while-catch-up loop
+- TS listener callbacks -> Zig `SlotListener` / `EpochListener`
+- TS wait promises -> Zig `waitForSlot` future + waiter registry
+- TS abort listener -> Zig `AbortSignal.Subscription`
+- TS fake timers -> Zig `ManualTimeProvider` + `ClockTimeHooks`
 
 ## Testing Clock
 
