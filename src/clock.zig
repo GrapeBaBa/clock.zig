@@ -1224,3 +1224,137 @@ test "currentSlot rearm restores next-slot cadence after catch-up" {
 
     signal.abort();
 }
+
+fn abortAfter(io: Io, signal: *AbortSignal, timeout_ms: i64) Io.Cancelable!void {
+    io.sleep(.fromMilliseconds(timeout_ms), .awake) catch return;
+    signal.abort();
+}
+
+test "system timer waitForSlot reaches target slot" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    var signal = AbortSignal.init(threaded.io());
+
+    var clock = Clock.init(
+        std.testing.allocator,
+        threaded.io(),
+        .{
+            .slot_duration_ms = 20,
+            .maximum_gossip_clock_disparity_ms = 5,
+            .slots_per_epoch = 4,
+        },
+        realNowMs(),
+        &signal,
+    );
+    defer clock.deinit();
+
+    var watchdog = threaded.io().async(abortAfter, .{ threaded.io(), &signal, 5_000 });
+    defer _ = watchdog.cancel(threaded.io()) catch {};
+
+    const start_slot = clock.currentSlot();
+    const target_slot = start_slot + 3;
+
+    var wait_for_target = clock.waitForSlot(target_slot);
+    try wait_for_target.await(threaded.io());
+
+    try std.testing.expect(clock.currentSlot() >= target_slot);
+}
+
+test "system timer slot listener emits ordered sequence" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    var signal = AbortSignal.init(threaded.io());
+    var recorder = EventRecorder.init(threaded.io());
+
+    var clock = Clock.init(
+        std.testing.allocator,
+        threaded.io(),
+        .{
+            .slot_duration_ms = 20,
+            .maximum_gossip_clock_disparity_ms = 5,
+            .slots_per_epoch = 4,
+        },
+        realNowMs(),
+        &signal,
+    );
+    defer clock.deinit();
+
+    try clock.onSlot(.{ .ctx = @ptrCast(&recorder), .callback = EventRecorder.onSlot });
+
+    var watchdog = threaded.io().async(abortAfter, .{ threaded.io(), &signal, 5_000 });
+    defer _ = watchdog.cancel(threaded.io()) catch {};
+
+    const base_slot = clock.currentSlot();
+    const target_slot = base_slot + 4;
+
+    var wait_for_target = clock.waitForSlot(target_slot);
+    try wait_for_target.await(threaded.io());
+
+    recorder.mutex.lockUncancelable(threaded.io());
+    defer recorder.mutex.unlock(threaded.io());
+
+    const expected_min_len = std.math.cast(usize, target_slot - base_slot) orelse unreachable;
+    try std.testing.expect(recorder.len >= expected_min_len);
+
+    var i: usize = 0;
+    while (i < recorder.len) : (i += 1) {
+        try std.testing.expectEqual(RecordedEventKind.slot, recorder.events[i].kind);
+        if (i > 0) {
+            try std.testing.expectEqual(recorder.events[i - 1].value + 1, recorder.events[i].value);
+        }
+    }
+    try std.testing.expect(recorder.events[recorder.len - 1].value >= target_slot);
+}
+
+test "system timer currentSlot catches up after paused timer loop" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    var signal = AbortSignal.init(threaded.io());
+    var recorder = EventRecorder.init(threaded.io());
+
+    var clock = Clock.init(
+        std.testing.allocator,
+        threaded.io(),
+        .{
+            .slot_duration_ms = 25,
+            .maximum_gossip_clock_disparity_ms = 5,
+            .slots_per_epoch = 4,
+        },
+        realNowMs(),
+        &signal,
+    );
+    defer clock.deinit();
+
+    try clock.onSlot(.{ .ctx = @ptrCast(&recorder), .callback = EventRecorder.onSlot });
+
+    const start_slot = clock.currentSlot();
+
+    // Emulate a process stall by stopping the timer loop while wall time keeps advancing.
+    if (clock.runner) |*runner| {
+        _ = runner.cancel(threaded.io());
+        clock.runner = null;
+    }
+
+    try threaded.io().sleep(.fromMilliseconds(180), .awake);
+
+    const caught_up_slot = clock.currentSlot();
+    try std.testing.expect(caught_up_slot >= start_slot + 4);
+
+    // Freeze again before assertions so background ticking cannot race this check.
+    if (clock.runner) |*runner| {
+        _ = runner.cancel(threaded.io());
+        clock.runner = null;
+    }
+
+    recorder.mutex.lockUncancelable(threaded.io());
+    defer recorder.mutex.unlock(threaded.io());
+
+    try std.testing.expect(recorder.len >= 4);
+    var i: usize = 1;
+    while (i < recorder.len) : (i += 1) {
+        try std.testing.expectEqual(RecordedEventKind.slot, recorder.events[i - 1].kind);
+        try std.testing.expectEqual(RecordedEventKind.slot, recorder.events[i].kind);
+        try std.testing.expect(recorder.events[i].value > recorder.events[i - 1].value);
+    }
+    try std.testing.expect(recorder.events[recorder.len - 1].value >= caught_up_slot);
+}
