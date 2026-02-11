@@ -1,6 +1,6 @@
 # clock.zig
 
-A small beacon-style slot clock library in Zig.
+A beacon slot clock in Zig.
 
 ## Build and Run
 
@@ -26,10 +26,6 @@ zig build run-example
 4. Wait API:
    - `waitForSlot(target)` returns when `currentSlot() >= target`.
    - Abort wakes waiters and returns `error.Aborted`.
-5. Time model:
-   - Public time inputs are milliseconds (`u64`).
-   - `Slot` and `Epoch` are `u64`.
-   - Time arithmetic reports `error.Overflow` on overflow.
 
 ## Testing
 
