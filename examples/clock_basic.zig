@@ -34,6 +34,7 @@ pub fn main() !void {
     std.debug.print("start_slot={d}, waiting for slot {d}...\n", .{ start_slot, start_slot + 3 });
 
     var fut = try ec.waitForSlot(start_slot + 3);
+    errdefer fut.cancel();
     try fut.await(io);
 
     std.debug.print("done.\n", .{});

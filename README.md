@@ -57,7 +57,7 @@ init() → onSlot/onEpoch() → start() → ... → stop() → join() → deinit
 - `init` — in-place initialization (self-referential struct, not returned by value)
 - `start` — spawns `runAutoLoop` fiber via `std.Io.async`. Idempotent
 - `stop` — signals loop to exit, aborts all pending waiters. Idempotent
-- `join` — awaits loop fiber completion (workaround for Zig bug [#31307](https://codeberg.org/ziglang/zig/issues/31307))
+- `join` — awaits loop fiber completion via `Future.cancel`
 - `deinit` — calls `stop()` + `join()`, frees all resources
 
 **Listener API:**
@@ -75,13 +75,15 @@ _ = clock.offSlot(id);
 
 ```zig
 var fut = try clock.waitForSlot(target_slot);
+errdefer fut.cancel();
 try fut.await(io);
 ```
 
 - Returns immediately if already at or past target slot
 - Future-based API backed by `std.Io.Event` + `std.Io.Future`
 - Dispatched by `advanceAndDispatch` when `current_slot >= target`
-- `cancelWait` available for error-path cleanup
+- `fut.cancel()` available for error-path cleanup (releases `WaitState` and removes from waiters list)
+- Use `errdefer fut.cancel()` between `waitForSlot` and `await` to guarantee cleanup on error
 - Returns `error.Aborted` on `stop()`
 
 **Catch-up semantics (matching TS `get currentSlot()`):**
@@ -94,7 +96,7 @@ Pure arithmetic helpers (`slotWithFutureTolerance`, `slotWithPastTolerance`, `se
 
 **Auto-loop (`runAutoLoop`):**
 
-- Sleeps in 500ms chunks for prompt `stop()` response (cannot cancel sleeping futures due to Zig bug #31307)
+- Sleeps until next slot boundary; `stop()` cancels the sleep future directly via `Future.cancel`
 - Skips advancement pre-genesis (`currentSlot()` returns `null`)
 - Checks `stopped` flag in `advanceAndDispatch` loop (matches TS's `!this.signal.aborted`)
 - Falls back to `self.stop()` + `break` if `msUntilNextSlot` returns `null` (config overflow defense-in-depth)
@@ -116,7 +118,7 @@ This implementation matches the Lodestar `Clock` class behavior:
 | `get currentSlot()` catches up events before returning | `catchUp()` called in all current-state accessors |
 | `onNextSlot` loop checks `!this.signal.aborted` | `advanceAndDispatch` checks `self.stopped` per event |
 | `waitForSlot` uses `this.currentSlot` getter (triggers catch-up) | `catchUp()` + `current_slot` fast-path |
-| `setTimeout(this.onNextSlot, this.msUntilNextSlot())` | `std.Io.sleep` in 500ms chunks + `advanceAndDispatch` |
+| `setTimeout(this.onNextSlot, this.msUntilNextSlot())` | `std.Io.sleep` + `Future.cancel` on stop |
 | `slot 0` not emitted pre-genesis | `currentSlot()` returns `null` pre-genesis, loop skips |
 
 ## Example
@@ -158,6 +160,7 @@ pub fn main() !void {
     std.debug.print("start_slot={d}, waiting for slot {d}...\n", .{ start_slot, start_slot + 3 });
 
     var fut = try ec.waitForSlot(start_slot + 3);
+    errdefer fut.cancel();
     try fut.await(io);
 
     std.debug.print("done.\n", .{});
